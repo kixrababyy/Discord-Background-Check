@@ -8,42 +8,43 @@ from typing import Optional, List, Dict
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Roblox API endpoints
-ROBLOX_USER_API = "https://users.roblox.com/v1/users/{}"
-ROBLOX_FRIENDS_API = "https://friends.roblox.com/v1/users/{}/friends"
-ROBLOX_GROUPS_API = "https://groups.roblox.com/v2/users/{}/groups/roles"
-ROBLOX_BADGES_API = "https://badges.roblox.com/v1/users/{}/badges"
+ROBLOX_USER_API        = "https://users.roblox.com/v1/users/{}"
+ROBLOX_FRIENDS_API     = "https://friends.roblox.com/v1/users/{}/friends"
+ROBLOX_GROUPS_API      = "https://groups.roblox.com/v2/users/{}/groups/roles"
+ROBLOX_BADGES_API      = "https://badges.roblox.com/v1/users/{}/badges"
 ROBLOX_USERNAME_SEARCH = "https://users.roblox.com/v1/users/search?keyword={}&limit=100"
+ROBLOX_PROFILE_URL     = "https://www.roblox.com/users/{}/profile"
 
-# Google Doc blacklist URL (can be overridden by environment variable)
 BLACKLIST_DOC_URL = os.getenv(
     "BLACKLIST_DOC_URL",
     "https://docs.google.com/document/d/1vzYg0-zXWNLPXdd8KJVOzKsfdL5MV2CC9IX47JblvB0/export?format=txt"
 )
 
-# CUSA Group ID
-CUSA_GROUP_ID = "4219097"
+# Google Sheets blacklist — exported as CSV (sheet must be set to "Anyone with link can view")
+BLACKLIST_SHEET_ID  = "1w-wsgtVdPsVotwvkk-v6jR0ZO673j4zgxmjV4mGymIs"
+BLACKLIST_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{BLACKLIST_SHEET_ID}/export?format=csv"
+
+CUSA_GROUP_ID   = "4219097"
 CUSA_GROUP_NAME = "CUSA United States Military"
+
 
 class RobloxChecker:
     def __init__(self):
-        self.blacklisted_groups = []
-        
+        self.blacklisted_groups          = []
+        self.sheet_blacklist_by_username = {}
+        self.sheet_blacklist_by_id       = {}
+
     async def fetch_blacklist(self):
-        """Fetch blacklisted groups from Google Doc"""
         try:
             response = requests.get(BLACKLIST_DOC_URL, timeout=10)
             if response.status_code == 200:
-                content = response.text
-                group_ids = re.findall(r'\b(\d{6,})\b', content)
+                group_ids = re.findall(r'\b(\d{6,})\b', response.text)
                 self.blacklisted_groups = list(set(group_ids))
                 print(f"Loaded {len(self.blacklisted_groups)} blacklisted groups")
                 return True
@@ -51,420 +52,380 @@ class RobloxChecker:
         except Exception as e:
             print(f"Error fetching blacklist: {e}")
             return False
-    
-    def get_user_info(self, user_id: int) -> Optional[Dict]:
-        """Get basic user information"""
+
+    async def fetch_sheet_blacklist(self):
+        """Fetch and parse the Google Sheets blacklist using exact column positions.
+        
+        Sheet layout (1-indexed columns):
+          B (index 1)  = Username / Name
+          D (index 3)  = Roblox User ID
+          H/I (index 7) = Ban length (merged cells)
+          K (index 10) = Appealable
+        """
         try:
-            response = requests.get(ROBLOX_USER_API.format(user_id))
-            if response.status_code == 200:
-                return response.json()
-            return None
+            response = requests.get(BLACKLIST_SHEET_URL, timeout=10)
+            if response.status_code != 200:
+                print(f"Sheet blacklist fetch failed: HTTP {response.status_code}")
+                return False
+
+            import csv, io
+            reader = csv.reader(io.StringIO(response.text))
+            rows   = list(reader)
+
+            if not rows:
+                print("Sheet blacklist is empty.")
+                return False
+
+            self.sheet_blacklist_by_username = {}
+            self.sheet_blacklist_by_id       = {}
+
+            # Skip header row(s) — skip any row where column D isn't a number
+            for row in rows[1:]:
+                # Pad short rows so index access never throws
+                while len(row) < 11:
+                    row.append('')
+
+                name      = row[1].strip()   # Column B
+                uid       = row[3].strip()   # Column D
+                length    = row[7].strip()   # Column H (merged H/I)
+                appealable = row[10].strip() # Column K
+
+                # Skip blank/header rows
+                if not uid or not uid.isdigit():
+                    continue
+
+                entry = {
+                    'username':   name,
+                    'user_id':    uid,
+                    'length':     length or 'Not specified',
+                    'appealable': appealable or 'Not specified',
+                }
+
+                if name:
+                    self.sheet_blacklist_by_username[name.lower()] = entry
+                self.sheet_blacklist_by_id[uid] = entry
+
+            total = len(self.sheet_blacklist_by_id)
+            print(f"Loaded {total} entries from sheet blacklist")
+            return True
+
+        except Exception as e:
+            print(f"Error fetching sheet blacklist: {e}")
+            return False
+
+    def check_sheet_blacklist(self, username: str, user_id: int) -> Optional[Dict]:
+        """Return the blacklist entry if user is found by ID or username, else None."""
+        return (
+            self.sheet_blacklist_by_id.get(str(user_id)) or
+            self.sheet_blacklist_by_username.get(username.lower())
+        )
+
+    def format_sheet_entry(self, entry: Dict) -> str:
+        """Format a sheet entry for display in the embed."""
+        appealable = entry.get('appealable', 'Not specified')
+        length     = entry.get('length', 'Not specified')
+
+        # Normalise common appealable values
+        appeal_lower = appealable.lower()
+        if appeal_lower in ('yes', 'y', 'true'):
+            appeal_display = '✅ Yes'
+        elif appeal_lower in ('no', 'n', 'false'):
+            appeal_display = '❌ No'
+        else:
+            appeal_display = appealable or 'Not specified'
+
+        return (
+            f"**Length:** {length}\n"
+            f"**Appealable:** {appeal_display}"
+        )
+
+    def get_user_info(self, user_id: int) -> Optional[Dict]:
+        try:
+            r = requests.get(ROBLOX_USER_API.format(user_id))
+            return r.json() if r.status_code == 200 else None
         except Exception as e:
             print(f"Error fetching user info: {e}")
             return None
-    
-    def get_friends_count(self, user_id: int) -> Optional[int]:
-        """Get number of friends"""
+
+    def get_friends(self, user_id: int) -> Optional[List]:
         try:
-            response = requests.get(ROBLOX_FRIENDS_API.format(user_id))
-            if response.status_code == 200:
-                friends = response.json().get('data', [])
-                return len(friends)
-            return None
+            r = requests.get(ROBLOX_FRIENDS_API.format(user_id))
+            return r.json().get('data', []) if r.status_code == 200 else None
         except Exception as e:
             print(f"Error fetching friends: {e}")
             return None
-    
+
     def get_user_groups(self, user_id: int) -> Optional[List[Dict]]:
-        """Get user's group IDs and membership info"""
         try:
-            response = requests.get(ROBLOX_GROUPS_API.format(user_id))
-            if response.status_code == 200:
-                data = response.json().get('data', [])
-                groups = []
-                for group_data in data:
-                    group_info = {
-                        'id': str(group_data['group']['id']),
-                        'name': group_data['group']['name'],
-                        'role': group_data['role']['name']
+            r = requests.get(ROBLOX_GROUPS_API.format(user_id))
+            if r.status_code == 200:
+                return [
+                    {
+                        'id':   str(g['group']['id']),
+                        'name': g['group']['name'],
+                        'role': g['role']['name']
                     }
-                    groups.append(group_info)
-                return groups
+                    for g in r.json().get('data', [])
+                ]
             return None
         except Exception as e:
             print(f"Error fetching groups: {e}")
             return None
-    
+
     def get_badges_count(self, user_id: int) -> Optional[int]:
-        """Get number of badges"""
         try:
-            response = requests.get(ROBLOX_BADGES_API.format(user_id))
-            if response.status_code == 200:
-                data = response.json()
-                return len(data.get('data', []))
-            return None
+            r = requests.get(ROBLOX_BADGES_API.format(user_id))
+            return len(r.json().get('data', [])) if r.status_code == 200 else None
         except Exception as e:
             print(f"Error fetching badges: {e}")
             return None
-    
-    def check_account_age(self, created_date: str) -> bool:
-        """Check if account is older than 6 months"""
+
+    def get_account_age_months(self, created_date: str) -> Optional[float]:
         try:
             created = datetime.strptime(created_date, "%Y-%m-%dT%H:%M:%S.%fZ")
-            six_months_ago = datetime.now() - timedelta(days=180)
-            return created < six_months_ago
+            delta = datetime.now() - created
+            return delta.days / 30.44  # average days per month
         except Exception as e:
-            print(f"Error checking account age: {e}")
-            return False
-    
-    def find_similar_usernames(self, username: str, limit: int = 50) -> List[Dict]:
-        """Find users with similar usernames"""
+            print(f"Error calculating account age: {e}")
+            return None
+
+    def get_group_join_date(self, group_id: str, user_id: int) -> Optional[str]:
         try:
-            response = requests.get(ROBLOX_USERNAME_SEARCH.format(username))
-            if response.status_code == 200:
-                data = response.json().get('data', [])
-                similar = []
-                username_lower = username.lower()
-                
-                for user in data[:limit]:
-                    other_username = user.get('name', '').lower()
-                    if (username_lower in other_username or 
-                        other_username in username_lower or
-                        self._username_similarity(username_lower, other_username) > 0.6):
-                        similar.append(user)
-                
-                return similar
-            return []
+            url = f"https://groups.roblox.com/v1/groups/{group_id}/users?limit=100"
+            r = requests.get(url)
+            if r.status_code == 200:
+                for member in r.json().get('data', []):
+                    if member.get('userId') == user_id:
+                        return member.get('joinedDate') or member.get('created')
+            return None
+        except Exception as e:
+            print(f"Error fetching group join date: {e}")
+            return None
+
+    def get_join_date_months_ago(self, join_date_str: str) -> Optional[float]:
+        try:
+            parsed = datetime.strptime(join_date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+            return (datetime.now() - parsed).days / 30.44
+        except:
+            return None
+
+    def find_similar_usernames(self, username: str, user_id: int) -> List[Dict]:
+        """Find similar usernames, excluding the account being checked."""
+        try:
+            r = requests.get(ROBLOX_USERNAME_SEARCH.format(username))
+            if r.status_code != 200:
+                return []
+
+            username_lower = username.lower()
+            similar = []
+
+            for user in r.json().get('data', []):
+                # Skip the account we're checking
+                if user.get('id') == user_id:
+                    continue
+
+                other = user.get('name', '').lower()
+                if (username_lower in other or
+                        other in username_lower or
+                        self._similarity(username_lower, other) > 0.6):
+                    similar.append(user)
+
+            return similar
         except Exception as e:
             print(f"Error searching usernames: {e}")
             return []
-    
-    def _username_similarity(self, name1: str, name2: str) -> float:
-        """Calculate basic username similarity"""
-        clean1 = re.sub(r'[^a-z]', '', name1)
-        clean2 = re.sub(r'[^a-z]', '', name2)
-        
-        if not clean1 or not clean2:
-            return 0.0
-        
-        common = sum(1 for c in clean1 if c in clean2)
-        return common / max(len(clean1), len(clean2))
-    
-    def get_group_join_date(self, group_id: str, user_id: int) -> Optional[str]:
-        """Get when a user joined a specific group"""
-        try:
-            url = f"https://groups.roblox.com/v1/groups/{group_id}/users?limit=100"
-            response = requests.get(url)
-            
-            if response.status_code == 200:
-                data = response.json().get('data', [])
-                for member in data:
-                    if member.get('userId') == user_id:
-                        join_date = member.get('joinedDate') or member.get('created')
-                        if join_date:
-                            return join_date
-            return None
-        except Exception as e:
-            print(f"Error fetching group join date for group {group_id}: {e}")
-            return None
-    
-    def get_all_group_join_dates(self, user_groups: List[Dict], user_id: int) -> Dict[str, Optional[str]]:
-        """Get join dates for all user's groups"""
-        join_dates = {}
-        for group in user_groups:
-            group_id = group['id']
-            join_date = self.get_group_join_date(group_id, user_id)
-            join_dates[group_id] = join_date
-        return join_dates
-    
-    def check_blacklisted_groups(self, user_groups: List[Dict]) -> List[Dict]:
-        """Check if user is in any blacklisted groups"""
-        blacklisted = []
-        for group in user_groups:
-            if group['id'] in self.blacklisted_groups:
-                blacklisted.append(group)
-        return blacklisted
 
-# Initialize checker
+    def _similarity(self, a: str, b: str) -> float:
+        ca = re.sub(r'[^a-z]', '', a)
+        cb = re.sub(r'[^a-z]', '', b)
+        if not ca or not cb:
+            return 0.0
+        common = sum(1 for c in ca if c in cb)
+        return common / max(len(ca), len(cb))
+
+    def check_blacklisted_groups(self, user_groups: List[Dict]) -> List[Dict]:
+        return [g for g in user_groups if g['id'] in self.blacklisted_groups]
+
+
 checker = RobloxChecker()
+
 
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     await checker.fetch_blacklist()
+    await checker.fetch_sheet_blacklist()
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} command(s)")
     except Exception as e:
         print(f"Error syncing commands: {e}")
 
-@bot.tree.command(name="background-check", description="Comprehensive background check on a Roblox user")
+
+@bot.tree.command(name="background-check", description="Run a full background check on a Roblox user")
 @app_commands.describe(user_id="The Roblox user ID to check")
 async def background_check(interaction: discord.Interaction, user_id: int):
-    """Perform comprehensive background check with full report"""
     await interaction.response.defer()
-    
+
     try:
-        # Send initial status
-        status_msg = await interaction.followup.send(f"🔍 **Running comprehensive background check...**\nGathering data, please wait...")
-        
-        # Get user info
+        # ── Fetch all data ────────────────────────────────────────────────────
         user_info = checker.get_user_info(user_id)
         if not user_info:
-            await interaction.edit_original_response(content=f"❌ Could not find user with ID: {user_id}")
+            await interaction.followup.send(f"❌ Could not find a Roblox user with ID `{user_id}`.")
             return
-        
-        username = user_info.get('name', 'Unknown')
-        display_name = user_info.get('displayName', username)
+
+        username     = user_info.get('name', 'Unknown')
         created_date = user_info.get('created', '')
-        
-        # Perform all checks
-        friends_count = checker.get_friends_count(user_id)
-        user_groups = checker.get_user_groups(user_id)
-        badges_count = checker.get_badges_count(user_id)
-        account_older_than_6m = checker.check_account_age(created_date)
-        similar_users = checker.find_similar_usernames(username)
-        
-        # Check CUSA membership
-        cusa_membership = None
-        cusa_join_date = None
-        if user_groups:
-            for group in user_groups:
-                if group['id'] == CUSA_GROUP_ID:
-                    cusa_membership = group
-                    cusa_join_date = checker.get_group_join_date(CUSA_GROUP_ID, user_id)
-                    break
-        
-        # Check blacklisted groups
-        blacklisted = []
-        blacklist_join_dates = {}
-        if user_groups:
-            blacklisted = checker.check_blacklisted_groups(user_groups)
-            if blacklisted:
-                blacklist_join_dates = checker.get_all_group_join_dates(blacklisted, user_id)
-        
-        # Get all group join dates
-        all_group_join_dates = {}
-        if user_groups:
-            all_group_join_dates = checker.get_all_group_join_dates(user_groups, user_id)
-        
-        # === BUILD COMPREHENSIVE REPORT ===
-        embed = discord.Embed(
-            title=f"📋 COMPREHENSIVE BACKGROUND REPORT",
-            description=f"**User:** {username} ({display_name})\n**ID:** {user_id}",
-            color=discord.Color.blue(),
-            timestamp=datetime.now()
-        )
-        
-        profile_url = f"https://www.roblox.com/users/{user_id}/profile"
-        embed.add_field(
-            name="🔗 Profile Link",
-            value=f"[View Roblox Profile]({profile_url})",
-            inline=False
-        )
-        
-        # === CUSA MEMBERSHIP CHECK ===
+        profile_url  = ROBLOX_PROFILE_URL.format(user_id)
+
+        friends      = checker.get_friends(user_id)
+        user_groups  = checker.get_user_groups(user_id) or []
+        age_months   = checker.get_account_age_months(created_date)
+        similar_users = checker.find_similar_usernames(username, user_id)
+        blacklisted  = checker.check_blacklisted_groups(user_groups)
+        sheet_entry  = checker.check_sheet_blacklist(username, user_id)
+
+        # CUSA check
+        cusa_membership  = next((g for g in user_groups if g['id'] == CUSA_GROUP_ID), None)
+        cusa_months_in   = None
         if cusa_membership:
-            cusa_role = cusa_membership['role']
+            cusa_join_date = checker.get_group_join_date(CUSA_GROUP_ID, user_id)
             if cusa_join_date:
-                try:
-                    parsed_date = datetime.strptime(cusa_join_date, "%Y-%m-%dT%H:%M:%S.%fZ")
-                    formatted_date = parsed_date.strftime("%B %d, %Y")
-                    days_ago = (datetime.now() - parsed_date).days
-                    cusa_info = f"✅ **MEMBER**\nRole: {cusa_role}\nJoined: {formatted_date} ({days_ago} days ago)"
-                except:
-                    cusa_info = f"✅ **MEMBER**\nRole: {cusa_role}\nJoined: Unknown"
-            else:
-                cusa_info = f"✅ **MEMBER**\nRole: {cusa_role}\nJoin date unavailable"
-        else:
-            cusa_info = "❌ **NOT A MEMBER**"
-        
-        embed.add_field(
-            name="🎖️ CUSA United States Military",
-            value=cusa_info,
-            inline=False
-        )
-        
-        # === ACCOUNT DETAILS ===
-        created_formatted = created_date.split('T')[0] if created_date else "Unknown"
-        age_status = "✅ Yes" if account_older_than_6m else "❌ No"
-        
-        account_info = f"**Created:** {created_formatted}\n**Older than 6 months:** {age_status}"
-        embed.add_field(
-            name="📅 Account Age",
-            value=account_info,
-            inline=True
-        )
-        
-        # Friends
-        friends_status = "❌ Yes" if friends_count is not None and friends_count < 15 else "✅ No"
-        friends_info = f"**Total Friends:** {friends_count if friends_count is not None else 'Unknown'}\n**Less than 15:** {friends_status}"
-        embed.add_field(
-            name="👫 Friends",
-            value=friends_info,
-            inline=True
-        )
-        
-        # Badges
-        embed.add_field(
-            name="🏆 Badges",
-            value=f"**Total:** {badges_count if badges_count is not None else 'Unknown'}",
-            inline=True
-        )
-        
-        # === SUSPICIOUS ALTS ===
+                cusa_months_in = checker.get_join_date_months_ago(cusa_join_date)
+
+        friends_count = len(friends) if friends is not None else None
+
+        # ── Evaluate each field ───────────────────────────────────────────────
+
+        # Suspicious alts
         if similar_users:
-            alt_usernames = [f"• {u.get('name')} (ID: {u.get('id')})" for u in similar_users[:5]]
-            alt_text = "\n".join(alt_usernames)
+            alt_lines = [
+                f"[{u.get('name')}]({ROBLOX_PROFILE_URL.format(u.get('id'))})"
+                for u in similar_users[:5]
+            ]
+            alts_value = ", ".join(alt_lines)
             if len(similar_users) > 5:
-                alt_text += f"\n*...and {len(similar_users) - 5} more similar accounts*"
+                alts_value += f" (+{len(similar_users) - 5} more)"
         else:
-            alt_text = "✅ None detected"
-        
-        embed.add_field(
-            name="👥 Suspicious Similar Accounts",
-            value=alt_text,
-            inline=False
-        )
-        
-        # === BLACKLISTED GROUPS ===
+            alts_value = "None"
+
+        # Blacklisted — groups doc
         if blacklisted:
-            blacklist_details = []
-            for group in blacklisted[:3]:
-                group_id = group['id']
-                group_name = group['name']
-                join_date = blacklist_join_dates.get(group_id)
-                
-                if join_date:
-                    try:
-                        parsed_date = datetime.strptime(join_date, "%Y-%m-%dT%H:%M:%S.%fZ")
-                        formatted_date = parsed_date.strftime("%b %d, %Y")
-                        days_ago = (datetime.now() - parsed_date).days
-                        blacklist_details.append(f"🚫 **{group_name}**\nID: {group_id} | Joined: {formatted_date} ({days_ago} days ago)")
-                    except:
-                        blacklist_details.append(f"🚫 **{group_name}**\nID: {group_id} | Joined: Unknown")
-                else:
-                    blacklist_details.append(f"🚫 **{group_name}**\nID: {group_id} | Join date unavailable")
-            
-            blacklist_text = "\n\n".join(blacklist_details)
+            blacklist_value = ", ".join(g['name'] for g in blacklisted[:3])
             if len(blacklisted) > 3:
-                blacklist_text += f"\n\n*...and {len(blacklisted) - 3} more blacklisted groups*"
+                blacklist_value += f" (+{len(blacklisted) - 3} more)"
         else:
-            blacklist_text = "✅ User is not in any blacklisted groups"
-        
-        embed.add_field(
-            name=f"🚫 Blacklisted Groups ({len(blacklisted)} found)",
-            value=blacklist_text,
-            inline=False
-        )
-        
-        # === ALL GROUPS ===
-        if user_groups:
-            blacklisted_ids = [g['id'] for g in blacklisted]
-            other_groups = [g for g in user_groups if g['id'] not in blacklisted_ids and g['id'] != CUSA_GROUP_ID]
-            
-            if other_groups:
-                group_list = []
-                for group in other_groups[:5]:
-                    group_id = group['id']
-                    group_name = group['name']
-                    join_date = all_group_join_dates.get(group_id)
-                    
-                    if join_date:
-                        try:
-                            parsed_date = datetime.strptime(join_date, "%Y-%m-%dT%H:%M:%S.%fZ")
-                            formatted_date = parsed_date.strftime("%b %d, %Y")
-                            days_ago = (datetime.now() - parsed_date).days
-                            group_list.append(f"• **{group_name}**\n  Role: {group['role']} | Joined: {formatted_date} ({days_ago}d ago)")
-                        except:
-                            group_list.append(f"• **{group_name}**\n  Role: {group['role']} | Joined: Unknown")
-                    else:
-                        group_list.append(f"• **{group_name}**\n  Role: {group['role']} | Join date unavailable")
-                
-                groups_text = "\n\n".join(group_list)
-                if len(other_groups) > 5:
-                    groups_text += f"\n\n*...and {len(other_groups) - 5} more groups*"
-            else:
-                groups_text = "No other groups"
+            blacklist_value = "No"
+
+        # Blacklisted — sheet database
+        if sheet_entry:
+            sheet_display = checker.format_sheet_entry(sheet_entry)
+            sheet_name    = sheet_entry.get('username', username)
+            sheet_value   = f"⚠️ **Yes — {sheet_name}**\n{sheet_display}"
         else:
-            groups_text = "User is not in any groups"
-        
-        total_groups = len(user_groups) if user_groups else 0
-        embed.add_field(
-            name=f"📊 Other Groups (Total: {total_groups})",
-            value=groups_text,
-            inline=False
-        )
-        
-        # === RISK ASSESSMENT ===
-        risk_score = 0
-        risk_factors = []
-        
+            sheet_value = "No"
+
+        # Affiliations (total group count, minimal)
+        affil_count   = len(user_groups)
+        affil_value   = f"{affil_count} group(s)" if affil_count else "None"
+
+        # Friends ≥ 15
+        if friends_count is None:
+            friends_value = "Unknown"
+        elif friends_count >= 15:
+            friends_value = f"Yes ({friends_count})"
+        else:
+            friends_value = f"No ({friends_count})"
+
+        # Account age 6+ months
+        if age_months is None:
+            age_value = "Unknown"
+        elif age_months >= 6:
+            age_value = f"Yes ({int(age_months)} months)"
+        else:
+            age_value = f"No ({int(age_months)} months)"
+
+        # CUSA 3+ months
+        if not cusa_membership:
+            cusa_value = "Not a member"
+        elif cusa_months_in is None:
+            cusa_value = "Member (join date unavailable)"
+        elif cusa_months_in >= 3:
+            cusa_value = f"Yes ({int(cusa_months_in)} months)"
+        else:
+            cusa_value = f"No ({int(cusa_months_in)} months)"
+
+        # ── Factors & Result ─────────────────────────────────────────────────
+        factors = []
+
         if similar_users:
-            risk_score += 2
-            risk_factors.append("Similar usernames detected")
+            factors.append(f"Suspicious alts detected ({len(similar_users)})")
         if blacklisted:
-            risk_score += 5
-            risk_factors.append(f"Member of {len(blacklisted)} blacklisted group(s)")
+            factors.append(f"In {len(blacklisted)} blacklisted group(s)")
+        if sheet_entry:
+            factors.append("Found in blacklist database")
         if friends_count is not None and friends_count < 15:
-            risk_score += 2
-            risk_factors.append("Low friend count")
-        if not account_older_than_6m:
-            risk_score += 3
-            risk_factors.append("New account (< 6 months)")
-        
-        risk_level = "🟢 LOW RISK"
-        risk_color = discord.Color.green()
-        if risk_score >= 7:
-            risk_level = "🔴 HIGH RISK"
-            risk_color = discord.Color.red()
-        elif risk_score >= 4:
-            risk_level = "🟡 MEDIUM RISK"
-            risk_color = discord.Color.yellow()
-        
-        embed.color = risk_color
-        
-        risk_text = f"**Level:** {risk_level}\n**Score:** {risk_score}/12\n\n"
-        if risk_factors:
-            risk_text += "**Factors:**\n" + "\n".join([f"• {factor}" for factor in risk_factors])
-        else:
-            risk_text += "✅ No significant risk factors detected"
-        
-        embed.add_field(
-            name="⚠️ RISK ASSESSMENT",
-            value=risk_text,
-            inline=False
-        )
-        
-        embed.set_footer(text=f"Report generated for User ID: {user_id}")
-        
-        await interaction.edit_original_response(content=None, embed=embed)
-        
+            factors.append(f"Low friend count ({friends_count})")
+        if age_months is not None and age_months < 6:
+            factors.append(f"Account under 6 months ({int(age_months)} months old)")
+        if cusa_membership and cusa_months_in is not None and cusa_months_in < 3:
+            factors.append(f"In CUSA for less than 3 months ({int(cusa_months_in)} months)")
+
+        # Hard fail conditions
+        hard_fail = bool(blacklisted) or bool(sheet_entry) or (friends_count is not None and friends_count < 15) or (age_months is not None and age_months < 6)
+        result_value = "❌ Failed" if hard_fail else "✅ Passed"
+        embed_color  = discord.Color.red() if hard_fail else discord.Color.green()
+
+        # ── Build embed ───────────────────────────────────────────────────────
+        embed = discord.Embed(color=embed_color, timestamp=datetime.now())
+
+        embed.add_field(name="Agent",                value=interaction.user.mention, inline=False)
+        embed.add_field(name="Target",               value=f"[{username}]({profile_url}) | `{user_id}`", inline=False)
+        embed.add_field(name="Suspicious Alts",      value=alts_value,    inline=False)
+        embed.add_field(name="Blacklisted (Groups)", value=blacklist_value, inline=False)
+        embed.add_field(name="Blacklisted (Database)", value=sheet_value,  inline=False)
+        embed.add_field(name="Affiliations",         value=affil_value,   inline=False)
+        embed.add_field(name="Friends ≥ 15",         value=friends_value, inline=True)
+        embed.add_field(name="Account 6+ months",    value=age_value,     inline=True)
+        embed.add_field(name="In CUSA 3+ months",    value=cusa_value,    inline=True)
+        embed.add_field(name="BGC Profile",          value=f"[View Profile]({profile_url})", inline=False)
+
+        if factors:
+            embed.add_field(name="Factors", value="\n".join(f"• {f}" for f in factors), inline=False)
+
+        embed.add_field(name="Result", value=result_value, inline=False)
+
+        embed.set_footer(text=f"Roblox ID: {user_id}")
+
+        await interaction.followup.send(embed=embed)
+
     except Exception as e:
-        await interaction.edit_original_response(content=f"❌ An error occurred: {str(e)}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}")
         print(f"Error in background check: {e}")
 
-@bot.tree.command(name="reload-blacklist", description="Reload the blacklisted groups from Google Doc")
-async def reload_blacklist(interaction: discord.Interaction):
-    """Reload blacklist (admin only)"""
-    await interaction.response.defer()
-    
-    success = await checker.fetch_blacklist()
-    if success:
-        await interaction.followup.send(f"✅ Blacklist reloaded! {len(checker.blacklisted_groups)} groups loaded.")
-    else:
-        await interaction.followup.send("❌ Failed to reload blacklist.")
 
-# Run the bot
+@bot.tree.command(name="reload-blacklist", description="Reload the blacklisted groups and database from their sources")
+async def reload_blacklist(interaction: discord.Interaction):
+    await interaction.response.defer()
+    doc_ok   = await checker.fetch_blacklist()
+    sheet_ok = await checker.fetch_sheet_blacklist()
+
+    lines = []
+    lines.append(f"{'✅' if doc_ok   else '❌'} Group blacklist — {len(checker.blacklisted_groups)} groups loaded")
+    sheet_total = max(len(checker.sheet_blacklist_by_id), len(checker.sheet_blacklist_by_username))
+    lines.append(f"{'✅' if sheet_ok else '❌'} Sheet blacklist — {sheet_total} entries loaded")
+
+    if not sheet_ok:
+        lines.append("\n⚠️ Sheet may not be publicly accessible. Set it to **Anyone with the link → Viewer** in Google Sheets.")
+
+    await interaction.followup.send("\n".join(lines))
+
+
 if __name__ == "__main__":
-    print("Starting Roblox Background Check Bot...")
-    
-    # Get token from environment variable or use placeholder
     TOKEN = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
-    
+
     if TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE" or not TOKEN:
-        print("\n⚠️  WARNING: No Discord bot token found!")
-        print("Please set the DISCORD_BOT_TOKEN environment variable or create a .env file")
-        print("Get your token from: https://discord.com/developers/applications\n")
+        print("\n⚠️  Set DISCORD_BOT_TOKEN in your .env file or Railway Variables tab.")
+        print("    Get your token from: https://discord.com/developers/applications\n")
     else:
         bot.run(TOKEN)
