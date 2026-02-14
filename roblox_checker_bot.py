@@ -297,6 +297,42 @@ class RobloxChecker:
             print(f"Error fetching user info: {e}")
             return None
 
+    def resolve_user(self, query: str) -> Optional[Dict]:
+        """Resolve a query (numeric ID, @username, or display name) to a user info dict."""
+        query = query.strip().lstrip('@')
+
+        # ── Try numeric ID first ───────────────────────────────────────────────
+        if query.isdigit():
+            info = self.get_user_info(int(query))
+            if info and not info.get('errors'):
+                return info
+
+        # ── Try exact username match (POST endpoint) ───────────────────────────
+        try:
+            r = requests.post(
+                "https://users.roblox.com/v1/usernames/users",
+                json={"usernames": [query], "excludeBannedUsers": False},
+                timeout=10
+            )
+            if r.status_code == 200:
+                data = r.json().get('data', [])
+                if data:
+                    return self.get_user_info(data[0]['id'])
+        except Exception as e:
+            print(f"Error resolving by username: {e}")
+
+        # ── Fall back to keyword search (catches display names) ────────────────
+        try:
+            r = requests.get(ROBLOX_USERNAME_SEARCH.format(requests.utils.quote(query)), timeout=10)
+            if r.status_code == 200:
+                results = r.json().get('data', [])
+                if results:
+                    return self.get_user_info(results[0]['id'])
+        except Exception as e:
+            print(f"Error resolving by display name search: {e}")
+
+        return None
+
     def get_friends(self, user_id: int) -> Optional[List]:
         try:
             r = requests.get(ROBLOX_FRIENDS_API.format(user_id))
@@ -398,18 +434,21 @@ async def on_ready():
 
 
 @bot.tree.command(name="background-check", description="Run a full background check on a Roblox user")
-@app_commands.describe(user_id="The Roblox user ID to check")
-async def background_check(interaction: discord.Interaction, user_id: int):
+@app_commands.describe(user="Roblox user ID, username, or display name")
+async def background_check(interaction: discord.Interaction, user: str):
     await interaction.response.defer()
 
     try:
-        # ── Fetch all data ─────────────────────────────────────────────────────
-        user_info = checker.get_user_info(user_id)
-        if not user_info:
-            await interaction.followup.send(f"❌ Could not find a Roblox user with ID `{user_id}`.")
+        # ── Resolve the user ───────────────────────────────────────────────────
+        user_info = checker.resolve_user(user)
+        if not user_info or user_info.get('errors'):
+            await interaction.followup.send(f"❌ Could not find a Roblox user matching `{user}`.")
             return
 
-        username     = user_info.get('name', 'Unknown')
+        # name = @username (the unique login name), displayName = in-game display name
+        username     = user_info.get('name', 'Unknown')        # @username — used for all checks
+        display_name = user_info.get('displayName', username)  # display name — shown as extra info
+        user_id      = user_info.get('id')
         created_date = user_info.get('created', '')
         profile_url  = ROBLOX_PROFILE_URL.format(user_id)
 
@@ -533,8 +572,8 @@ async def background_check(interaction: discord.Interaction, user_id: int):
         # ── Build embed ────────────────────────────────────────────────────────
         embed = discord.Embed(color=embed_color, timestamp=datetime.now())
 
-        embed.add_field(name="Agent",                value=interaction.user.mention,                       inline=False)
-        embed.add_field(name="Target",               value=f"[{username}]({profile_url}) | `{user_id}`",  inline=False)
+        embed.add_field(name="Agent",                value=interaction.user.mention,                      inline=False)
+        embed.add_field(name="Target",               value=f"[{username}]({profile_url}) | `{user_id}`", inline=False)
         embed.add_field(name="Suspicious Alts",      value=alts_value,                                     inline=False)
         embed.add_field(name="Blacklisted (Groups)", value=blacklist_value,                                inline=False)
         embed.add_field(name="Blacklisted (DHS)",    value=dhs_value,                                      inline=False)
@@ -559,7 +598,138 @@ async def background_check(interaction: discord.Interaction, user_id: int):
         print(f"Error in background check: {e}")
 
 
-@bot.tree.command(name="reload-blacklist", description="Reload all blacklist databases")
+@bot.tree.command(name="friend-check", description="Scan a user's friends list against all blacklist databases")
+@app_commands.describe(user="Roblox user ID, username, or display name")
+async def friend_check(interaction: discord.Interaction, user: str):
+    await interaction.response.defer()
+
+    try:
+        # ── Resolve the user ───────────────────────────────────────────────────
+        user_info = checker.resolve_user(user)
+        if not user_info or user_info.get('errors'):
+            await interaction.followup.send(f"❌ Could not find a Roblox user matching `{user}`.")
+            return
+
+        username    = user_info.get('name', 'Unknown')
+        user_id     = user_info.get('id')
+        profile_url = ROBLOX_PROFILE_URL.format(user_id)
+
+        # ── Fetch friends ──────────────────────────────────────────────────────
+        friends = checker.get_friends(user_id)
+        if friends is None:
+            await interaction.followup.send("❌ Could not fetch friends list.")
+            return
+        if not friends:
+            await interaction.followup.send(f"**{username}** has no friends.")
+            return
+
+        # ── Check each friend against all databases ────────────────────────────
+        flagged = []
+
+        for friend in friends:
+            fid       = friend.get('id')
+            fname     = friend.get('name', 'Unknown')
+            fprofile  = ROBLOX_PROFILE_URL.format(fid)
+            hits      = []
+
+            # Blacklisted groups
+            fgroups = checker.get_user_groups(fid) or []
+            bl_groups = checker.check_blacklisted_groups(fgroups)
+            if bl_groups:
+                hits.append(f"Blacklisted group(s): {', '.join(g['name'] for g in bl_groups[:2])}")
+
+            # DHS
+            if checker.check_dhs(fname, fid):
+                hits.append("DHS Database")
+
+            # HoR
+            if checker.check_hor(fname, fid):
+                hits.append("HoR Database")
+
+            # Senate
+            if checker.check_senate(fname, fid):
+                hits.append("Senate Database")
+
+            if hits:
+                flagged.append({
+                    'name':    fname,
+                    'id':      fid,
+                    'profile': fprofile,
+                    'hits':    hits,
+                })
+
+        # ── Build embed ────────────────────────────────────────────────────────
+        total     = len(friends)
+        embed_color = discord.Color.red() if flagged else discord.Color.green()
+        embed = discord.Embed(
+            title=f"Friend Check — {username}",
+            color=embed_color,
+            timestamp=datetime.now()
+        )
+
+        embed.add_field(
+            name="Agent",
+            value=interaction.user.mention,
+            inline=False
+        )
+        embed.add_field(
+            name="Target",
+            value=f"[{username}]({profile_url}) | `{user_id}`",
+            inline=False
+        )
+        embed.add_field(
+            name="Friends Scanned",
+            value=str(total),
+            inline=True
+        )
+        embed.add_field(
+            name="Flagged",
+            value=str(len(flagged)),
+            inline=True
+        )
+
+        if flagged:
+            # Split into chunks to avoid hitting Discord's 1024 char field limit
+            chunk      = []
+            chunk_num  = 1
+            chunk_len  = 0
+
+            for f in flagged:
+                line = f"[{f['name']}]({f['profile']}) — {', '.join(f['hits'])}\n"
+                if chunk_len + len(line) > 950:
+                    embed.add_field(
+                        name=f"Flagged Friends ({chunk_num})",
+                        value="".join(chunk),
+                        inline=False
+                    )
+                    chunk     = []
+                    chunk_len = 0
+                    chunk_num += 1
+                chunk.append(line)
+                chunk_len += len(line)
+
+            if chunk:
+                embed.add_field(
+                    name=f"Flagged Friends{f' ({chunk_num})' if chunk_num > 1 else ''}",
+                    value="".join(chunk),
+                    inline=False
+                )
+        else:
+            embed.add_field(
+                name="Flagged Friends",
+                value="None found ✅",
+                inline=False
+            )
+
+        embed.set_footer(text=f"Roblox ID: {user_id}")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}")
+        print(f"Error in friend check: {e}")
+
+
+
 async def reload_blacklist(interaction: discord.Interaction):
     await interaction.response.defer()
 
