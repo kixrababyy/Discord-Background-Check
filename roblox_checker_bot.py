@@ -41,6 +41,10 @@ HOR_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{HOR_SHEET_ID}/export?f
 SENATE_SHEET_ID  = "1bhCQLx3J3pXjVA1HVxurRSacukVF00w8XBbwib4qB5k"
 SENATE_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SENATE_SHEET_ID}/export?format=csv"
 
+# Google Sheets API key — needed to detect strikethrough formatting in DHS sheet
+# Get one free at: https://console.cloud.google.com → Enable Sheets API → Create API key
+GOOGLE_API_KEY = ""  # Optional: add your Google API key here for strikethrough detection
+
 # ── CUSA group ─────────────────────────────────────────────────────────────────
 CUSA_GROUP_ID   = "4219097"
 CUSA_GROUP_NAME = "CUSA United States Military"
@@ -94,25 +98,98 @@ class RobloxChecker:
           3  = D = Roblox User ID
           7  = H = Ban length (merged H/I)
           10 = K = Appealable
+
+        Strikethrough on a row = previously blacklisted, now removed.
+        Detected via Google Sheets API v4 if GOOGLE_API_KEY is set,
+        otherwise falls back to CSV (all entries treated as active).
         """
+        self.dhs_by_id       = {}
+        self.dhs_by_username = {}
+
+        if GOOGLE_API_KEY:
+            return await self._fetch_dhs_with_formatting()
+        else:
+            return await self._fetch_dhs_csv()
+
+    async def _fetch_dhs_with_formatting(self):
+        """Fetch DHS sheet via Sheets API v4 — detects strikethrough (removed) entries."""
+        try:
+            fields = "sheets.data.rowData.values(formattedValue,userEnteredFormat.textFormat.strikethrough)"
+            url = (
+                f"https://sheets.googleapis.com/v4/spreadsheets/{DHS_SHEET_ID}"
+                f"?includeGridData=true&fields={fields}&key={GOOGLE_API_KEY}"
+            )
+            r = requests.get(url, timeout=15)
+            if r.status_code != 200:
+                print(f"[DHS] Sheets API failed (HTTP {r.status_code}), falling back to CSV")
+                return await self._fetch_dhs_csv()
+
+            rows = r.json().get('sheets', [{}])[0].get('data', [{}])[0].get('rowData', [])
+
+            # Skip header row (index 0)
+            for row_data in rows[1:]:
+                cells = row_data.get('values', [])
+
+                # Pad to at least 11 cells
+                while len(cells) < 11:
+                    cells.append({})
+
+                def cell_val(c):
+                    return c.get('formattedValue', '').strip()
+
+                def is_strikethrough(c):
+                    return c.get('userEnteredFormat', {}).get('textFormat', {}).get('strikethrough', False)
+
+                name       = cell_val(cells[1])   # B
+                uid        = cell_val(cells[3])   # D
+                length     = cell_val(cells[7])   # H
+                appealable = cell_val(cells[10])  # K
+
+                if not uid or not uid.isdigit():
+                    continue
+
+                # Row is removed if the name OR uid cell has strikethrough
+                removed = is_strikethrough(cells[1]) or is_strikethrough(cells[3])
+
+                entry = {
+                    'source':     'DHS Database',
+                    'username':   name,
+                    'user_id':    uid,
+                    'length':     length     or 'Not specified',
+                    'appealable': appealable or 'Not specified',
+                    'removed':    removed,
+                }
+
+                self.dhs_by_id[uid] = entry
+                if name:
+                    self.dhs_by_username[name.lower()] = entry
+
+            active  = sum(1 for e in self.dhs_by_id.values() if not e['removed'])
+            removed = sum(1 for e in self.dhs_by_id.values() if e['removed'])
+            print(f"[DHS] Loaded {len(self.dhs_by_id)} entries ({active} active, {removed} removed)")
+            return True
+
+        except Exception as e:
+            print(f"[DHS] Sheets API error: {e}, falling back to CSV")
+            return await self._fetch_dhs_csv()
+
+    async def _fetch_dhs_csv(self):
+        """Fallback: fetch DHS sheet as CSV — cannot detect strikethrough."""
         try:
             r = requests.get(DHS_SHEET_URL, timeout=10)
             if r.status_code != 200:
-                print(f"[DHS] Fetch failed: HTTP {r.status_code}")
+                print(f"[DHS] CSV fetch failed: HTTP {r.status_code}")
                 return False
 
-            self.dhs_by_id       = {}
-            self.dhs_by_username = {}
-
             reader = csv.reader(io.StringIO(r.text))
-            for row in list(reader)[1:]:          # skip header row
+            for row in list(reader)[1:]:
                 while len(row) < 11:
                     row.append('')
 
-                name       = row[1].strip()   # B
-                uid        = row[3].strip()   # D
-                length     = row[7].strip()   # H
-                appealable = row[10].strip()  # K
+                name       = row[1].strip()
+                uid        = row[3].strip()
+                length     = row[7].strip()
+                appealable = row[10].strip()
 
                 if not uid or not uid.isdigit():
                     continue
@@ -123,16 +200,17 @@ class RobloxChecker:
                     'user_id':    uid,
                     'length':     length     or 'Not specified',
                     'appealable': appealable or 'Not specified',
+                    'removed':    False,  # unknown without API key
                 }
 
                 self.dhs_by_id[uid] = entry
                 if name:
                     self.dhs_by_username[name.lower()] = entry
 
-            print(f"[DHS] Loaded {len(self.dhs_by_id)} entries")
+            print(f"[DHS] Loaded {len(self.dhs_by_id)} entries (strikethrough detection disabled — no API key)")
             return True
         except Exception as e:
-            print(f"[DHS] Error: {e}")
+            print(f"[DHS] CSV error: {e}")
             return False
 
     # ── HoR sheet ──────────────────────────────────────────────────────────────
@@ -495,8 +573,11 @@ async def background_check(interaction: discord.Interaction, user: str):
 
         # DHS database
         if dhs_entry:
-            dhs_name  = dhs_entry.get('username', username)
-            dhs_value = f"⚠️ **Yes — {dhs_name}**\n{checker.format_entry(dhs_entry)}"
+            dhs_name = dhs_entry.get('username', username)
+            if dhs_entry.get('removed'):
+                dhs_value = f"ℹ️ **Previously blacklisted (removed) — {dhs_name}**\n{checker.format_entry(dhs_entry)}"
+            else:
+                dhs_value = f"⚠️ **Yes — {dhs_name}**\n{checker.format_entry(dhs_entry)}"
         else:
             dhs_value = "No"
 
@@ -551,7 +632,10 @@ async def background_check(interaction: discord.Interaction, user: str):
         if blacklisted:
             factors.append(f"In {len(blacklisted)} blacklisted group(s)")
         if dhs_entry:
-            factors.append(f"Found in DHS Database")
+            if dhs_entry.get('removed'):
+                factors.append("Previously in DHS Database (removed)")
+            else:
+                factors.append("Found in DHS Database")
         if hor_entry:
             factors.append(f"Found in HoR Database")
         if senate_entry:
@@ -563,7 +647,8 @@ async def background_check(interaction: discord.Interaction, user: str):
         if cusa_membership and cusa_months_in is not None and cusa_months_in < 3:
             factors.append(f"In CUSA less than 3 months ({int(cusa_months_in)} months)")
 
-        hard_fail    = bool(blacklisted or dhs_entry or hor_entry or senate_entry) or \
+        dhs_active   = dhs_entry and not dhs_entry.get('removed')
+        hard_fail    = bool(blacklisted or dhs_active or hor_entry or senate_entry) or \
                        (friends_count is not None and friends_count < 15) or \
                        (age_months is not None and age_months < 6)
         result_value = "❌ Failed" if hard_fail else "✅ Passed"
@@ -627,10 +712,14 @@ async def friend_check(interaction: discord.Interaction, user: str):
         flagged = []
 
         for friend in friends:
-            fid       = friend.get('id')
-            fname     = friend.get('name', 'Unknown')
-            fprofile  = ROBLOX_PROFILE_URL.format(fid)
-            hits      = []
+            fid      = friend.get('id')
+            fname    = friend.get('name', '').strip()
+            # Fallback: if name missing, fetch directly
+            if not fname:
+                finfo = checker.get_user_info(fid)
+                fname = finfo.get('name', str(fid)) if finfo else str(fid)
+            fprofile = ROBLOX_PROFILE_URL.format(fid)
+            hits     = []
 
             # Blacklisted groups
             fgroups = checker.get_user_groups(fid) or []
@@ -639,8 +728,12 @@ async def friend_check(interaction: discord.Interaction, user: str):
                 hits.append(f"Blacklisted group(s): {', '.join(g['name'] for g in bl_groups[:2])}")
 
             # DHS
-            if checker.check_dhs(fname, fid):
-                hits.append("DHS Database")
+            fdhs = checker.check_dhs(fname, fid)
+            if fdhs:
+                if fdhs.get('removed'):
+                    hits.append("DHS Database (removed)")
+                else:
+                    hits.append("DHS Database")
 
             # HoR
             if checker.check_hor(fname, fid):
@@ -695,7 +788,7 @@ async def friend_check(interaction: discord.Interaction, user: str):
             chunk_len  = 0
 
             for f in flagged:
-                line = f"[{f['name']}]({f['profile']}) — {', '.join(f['hits'])}\n"
+                line = f"**[{f['name']}]({f['profile']})** — {', '.join(f['hits'])}\n"
                 if chunk_len + len(line) > 950:
                     embed.add_field(
                         name=f"Flagged Friends ({chunk_num})",
@@ -738,9 +831,13 @@ async def reload_blacklist(interaction: discord.Interaction):
     hor_ok    = await checker.fetch_hor()
     senate_ok = await checker.fetch_senate()
 
+    dhs_active  = sum(1 for e in checker.dhs_by_id.values() if not e.get('removed'))
+    dhs_removed = sum(1 for e in checker.dhs_by_id.values() if e.get('removed'))
+    dhs_detail  = f"{dhs_active} active, {dhs_removed} removed" if GOOGLE_API_KEY else f"{len(checker.dhs_by_id)} entries (no API key — strikethrough detection disabled)"
+
     lines = [
         f"{'✅' if doc_ok    else '❌'} Group blacklist — {len(checker.blacklisted_groups)} groups",
-        f"{'✅' if dhs_ok    else '❌'} DHS Database    — {len(checker.dhs_by_id)} entries",
+        f"{'✅' if dhs_ok    else '❌'} DHS Database    — {dhs_detail}",
         f"{'✅' if hor_ok    else '❌'} HoR Database    — {len(checker.hor_by_id)} entries",
         f"{'✅' if senate_ok else '❌'} Senate Database — {len(checker.senate_by_id)} entries",
     ]
