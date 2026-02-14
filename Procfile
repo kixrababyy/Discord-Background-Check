@@ -1,0 +1,1 @@
+worker: python roblox_checker_bot_secure.py
