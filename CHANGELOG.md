@@ -1,6 +1,6 @@
 # Changelog
 
-## Version 3.0 - Unified Command & Full Report
+## Version 3.1 - Unified Command & Full Report
 
 ### Major Changes 🎉
 
